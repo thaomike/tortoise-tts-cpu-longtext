@@ -1,31 +1,35 @@
 import os
 import random
 import uuid
+from contextlib import contextmanager
 from time import time
 from urllib import request
 
+import progressbar
 import torch
 import torch.nn.functional as F
-import progressbar
 import torchaudio
-
-from tortoise.models.classifier import AudioMiniEncoderWithClassifierHead
-from tortoise.models.diffusion_decoder import DiffusionTts
-from tortoise.models.autoregressive import UnifiedVoice
 from tqdm import tqdm
+from utils.text import split_and_recombine_text
+
 from tortoise.models.arch_util import TorchMelSpectrogram
+from tortoise.models.autoregressive import UnifiedVoice
+from tortoise.models.classifier import AudioMiniEncoderWithClassifierHead
 from tortoise.models.clvp import CLVP
 from tortoise.models.cvvp import CVVP
+from tortoise.models.diffusion_decoder import DiffusionTts
 from tortoise.models.random_latent_generator import RandomLatentConverter
 from tortoise.models.vocoder import UnivNetGenerator
-from tortoise.utils.audio import wav_to_univnet_mel, denormalize_tacotron_mel
-from tortoise.utils.diffusion import SpacedDiffusion, space_timesteps, get_named_beta_schedule
+from tortoise.utils.audio import denormalize_tacotron_mel, wav_to_univnet_mel
+from tortoise.utils.diffusion import (SpacedDiffusion, get_named_beta_schedule,
+                                      space_timesteps)
 from tortoise.utils.tokenizer import VoiceBpeTokenizer
 from tortoise.utils.wav2vec_alignment import Wav2VecAlignment
-from contextlib import contextmanager
+
 pbar = None
 
-DEFAULT_MODELS_DIR = os.path.join(os.path.expanduser('~'), '.cache', 'tortoise', 'models')
+DEFAULT_MODELS_DIR = os.path.join(
+    os.path.expanduser('~'), '.cache', 'tortoise', 'models')
 MODELS_DIR = os.environ.get('TORTOISE_MODELS_DIR', DEFAULT_MODELS_DIR)
 MODELS = {
     'autoregressive.pth': 'https://huggingface.co/jbetker/tortoise-tts-v2/resolve/main/.models/autoregressive.pth',
@@ -37,6 +41,7 @@ MODELS = {
     'rlg_auto.pth': 'https://huggingface.co/jbetker/tortoise-tts-v2/resolve/main/.models/rlg_auto.pth',
     'rlg_diffuser.pth': 'https://huggingface.co/jbetker/tortoise-tts-v2/resolve/main/.models/rlg_diffuser.pth',
 }
+
 
 def download_models(specific_models=None):
     """
@@ -149,15 +154,18 @@ def do_spectrogram_diffusion(diffusion_model, diffuser, latents, conditioning_la
     Uses the specified diffusion model to convert discrete codes into a spectrogram.
     """
     with torch.no_grad():
-        output_seq_len = latents.shape[1] * 4 * 24000 // 22050  # This diffusion model converts from 22kHz spectrogram codes to a 24kHz spectrogram signal.
+        # This diffusion model converts from 22kHz spectrogram codes to a 24kHz spectrogram signal.
+        output_seq_len = latents.shape[1] * 4 * 24000 // 22050
         output_shape = (latents.shape[0], 100, output_seq_len)
-        precomputed_embeddings = diffusion_model.timestep_independent(latents, conditioning_latents, output_seq_len, False)
+        precomputed_embeddings = diffusion_model.timestep_independent(
+            latents, conditioning_latents, output_seq_len, False)
 
         noise = torch.randn(output_shape, device=latents.device) * temperature
         mel = diffuser.p_sample_loop(diffusion_model, output_shape, noise=noise,
-                                      model_kwargs={'precomputed_aligned_embeddings': precomputed_embeddings},
+                                     model_kwargs={
+                                         'precomputed_aligned_embeddings': precomputed_embeddings},
                                      progress=verbose)
-        return denormalize_tacotron_mel(mel)[:,:,:output_seq_len]
+        return denormalize_tacotron_mel(mel)[:, :, :output_seq_len]
 
 
 def classify_audio_clip(clip):
@@ -169,7 +177,8 @@ def classify_audio_clip(clip):
     classifier = AudioMiniEncoderWithClassifierHead(2, spec_dim=1, embedding_dim=512, depth=5, downsample_factor=4,
                                                     resnet_blocks=2, attn_blocks=4, num_attn_heads=4, base_channels=32,
                                                     dropout=0, kernel_size=5, distribute_zero_label=False)
-    classifier.load_state_dict(torch.load(get_model_path('classifier.pth'), map_location=torch.device('cpu')))
+    classifier.load_state_dict(torch.load(get_model_path(
+        'classifier.pth'), map_location=torch.device('cpu')))
     clip = clip.cpu().unsqueeze(0)
     results = F.softmax(classifier(clip), dim=-1)
     return results[0][0]
@@ -201,15 +210,15 @@ def pick_best_batch_size_for_gpu():
             return 4
     return 1
 
+
 class TextToSpeech:
     """
     Main entry point into Tortoise.
     """
 
-    def __init__(self, autoregressive_batch_size=None, models_dir=MODELS_DIR, 
+    def __init__(self, autoregressive_batch_size=None, models_dir=MODELS_DIR,
                  enable_redaction=True, kv_cache=False, use_deepspeed=False, half=False, device=None,
                  tokenizer_vocab_file=None, tokenizer_basic=False):
-
         """
         Constructor
         :param autoregressive_batch_size: Specifies how many samples to generate per batch. Lower this if you are seeing
@@ -222,9 +231,14 @@ class TextToSpeech:
         :param device: Device to use when running the model. If omitted, the device will be automatically chosen.
         """
         self.models_dir = models_dir
-        self.autoregressive_batch_size = pick_best_batch_size_for_gpu() if autoregressive_batch_size is None else autoregressive_batch_size
+        self.autoregressive_batch_size = pick_best_batch_size_for_gpu(
+        ) if autoregressive_batch_size is None else autoregressive_batch_size
         self.enable_redaction = enable_redaction
-        self.device = torch.device('cuda' if torch.cuda.is_available() else'cpu')
+        if device:
+            self.device = device
+        else:
+            self.device = torch.device(
+                'cuda' if torch.cuda.is_available() else 'cpu')
         if torch.backends.mps.is_available():
             self.device = torch.device('mps')
         if self.enable_redaction:
@@ -237,47 +251,55 @@ class TextToSpeech:
         self.half = half
         if os.path.exists(f'{models_dir}/autoregressive.ptt'):
             # Assume this is a traced directory.
-            self.autoregressive = torch.jit.load(f'{models_dir}/autoregressive.ptt')
-            self.diffusion = torch.jit.load(f'{models_dir}/diffusion_decoder.ptt')
+            self.autoregressive = torch.jit.load(
+                f'{models_dir}/autoregressive.ptt')
+            self.diffusion = torch.jit.load(
+                f'{models_dir}/diffusion_decoder.ptt')
         else:
             self.autoregressive = UnifiedVoice(max_mel_tokens=604, max_text_tokens=402, max_conditioning_inputs=2, layers=30,
-                                          model_dim=1024,
-                                          heads=16, number_text_tokens=255, start_text_token=255, checkpointing=False,
-                                          train_solo_embeddings=False).cpu().eval()
-            self.autoregressive.load_state_dict(torch.load(get_model_path('autoregressive.pth', models_dir)), strict=False)
-            self.autoregressive.post_init_gpt2_config(use_deepspeed=use_deepspeed, kv_cache=kv_cache, half=self.half)
-            
+                                               model_dim=1024,
+                                               heads=16, number_text_tokens=255, start_text_token=255, checkpointing=False,
+                                               train_solo_embeddings=False).cpu().eval()
+            self.autoregressive.load_state_dict(torch.load(
+                get_model_path('autoregressive.pth', models_dir)), strict=False)
+            self.autoregressive.post_init_gpt2_config(
+                use_deepspeed=use_deepspeed, kv_cache=kv_cache, half=self.half)
+
             self.diffusion = DiffusionTts(model_channels=1024, num_layers=10, in_channels=100, out_channels=200,
                                           in_latent_channels=1024, in_tokens=8193, dropout=0, use_fp16=False, num_heads=16,
                                           layer_drop=0, unconditioned_percentage=0).cpu().eval()
-            self.diffusion.load_state_dict(torch.load(get_model_path('diffusion_decoder.pth', models_dir)))
+            self.diffusion.load_state_dict(torch.load(
+                get_model_path('diffusion_decoder.pth', models_dir)))
 
         self.clvp = CLVP(dim_text=768, dim_speech=768, dim_latent=768, num_text_tokens=256, text_enc_depth=20,
                          text_seq_len=350, text_heads=12,
                          num_speech_tokens=8192, speech_enc_depth=20, speech_heads=12, speech_seq_len=430,
                          use_xformers=True).cpu().eval()
-        self.clvp.load_state_dict(torch.load(get_model_path('clvp2.pth', models_dir)))
-        self.cvvp = None # CVVP model is only loaded if used.
+        self.clvp.load_state_dict(torch.load(
+            get_model_path('clvp2.pth', models_dir)))
+        self.cvvp = None  # CVVP model is only loaded if used.
 
         self.vocoder = UnivNetGenerator().cpu()
-        self.vocoder.load_state_dict(torch.load(get_model_path('vocoder.pth', models_dir), map_location=torch.device('cpu'))['model_g'])
+        self.vocoder.load_state_dict(torch.load(get_model_path(
+            'vocoder.pth', models_dir), map_location=torch.device('cpu'))['model_g'])
         self.vocoder.eval(inference=True)
 
         # Random latent generators (RLGs) are loaded lazily.
         self.rlg_auto = None
         self.rlg_diffusion = None
+
     @contextmanager
     def temporary_cuda(self, model):
         m = model.to(self.device)
         yield m
         m = model.cpu()
 
-    
     def load_cvvp(self):
         """Load CVVP model."""
         self.cvvp = CVVP(model_dim=512, transformer_heads=8, dropout=0, mel_codes=8192, conditioning_enc_depth=8, cond_mask_percentage=0,
                          speech_enc_depth=8, speech_mask_percentage=0, latent_multiplier=1).cpu().eval()
-        self.cvvp.load_state_dict(torch.load(get_model_path('cvvp.pth', self.models_dir)))
+        self.cvvp.load_state_dict(torch.load(
+            get_model_path('cvvp.pth', self.models_dir)))
 
     def get_conditioning_latents(self, voice_samples, return_mels=False):
         """
@@ -304,7 +326,8 @@ class TextToSpeech:
                 # The diffuser operates at a sample rate of 24000 (except for the latent inputs)
                 sample = torchaudio.functional.resample(sample, 22050, 24000)
                 sample = pad_or_truncate(sample, 102400)
-                cond_mel = wav_to_univnet_mel(sample.to(self.device), do_normalization=False, device=self.device)
+                cond_mel = wav_to_univnet_mel(
+                    sample.to(self.device), do_normalization=False, device=self.device)
                 diffusion_conds.append(cond_mel)
             diffusion_conds = torch.stack(diffusion_conds, dim=1)
 
@@ -321,9 +344,11 @@ class TextToSpeech:
         # Lazy-load the RLG models.
         if self.rlg_auto is None:
             self.rlg_auto = RandomLatentConverter(1024).eval()
-            self.rlg_auto.load_state_dict(torch.load(get_model_path('rlg_auto.pth', self.models_dir), map_location=torch.device('cpu')))
+            self.rlg_auto.load_state_dict(torch.load(get_model_path(
+                'rlg_auto.pth', self.models_dir), map_location=torch.device('cpu')))
             self.rlg_diffusion = RandomLatentConverter(2048).eval()
-            self.rlg_diffusion.load_state_dict(torch.load(get_model_path('rlg_diffuser.pth', self.models_dir), map_location=torch.device('cpu')))
+            self.rlg_diffusion.load_state_dict(torch.load(get_model_path(
+                'rlg_diffuser.pth', self.models_dir), map_location=torch.device('cpu')))
         with torch.no_grad():
             return self.rlg_auto(torch.tensor([0.0])), self.rlg_diffusion(torch.tensor([0.0]))
 
@@ -347,7 +372,8 @@ class TextToSpeech:
             'high_quality': {'num_autoregressive_samples': 256, 'diffusion_iterations': 400},
         }
         settings.update(presets[preset])
-        settings.update(kwargs) # allow overriding of preset settings with kwargs
+        # allow overriding of preset settings with kwargs
+        settings.update(kwargs)
         return self.tts(text, **settings)
 
     def tts(self, text, voice_samples=None, conditioning_latents=None, k=1, verbose=True, use_deterministic_seed=None,
@@ -404,14 +430,17 @@ class TextToSpeech:
         :return: Generated audio clip(s) as a torch tensor. Shape 1,S if k=1 else, (k,1,S) where S is the sample length.
                  Sample rate is 24kHz.
         """
-        deterministic_seed = self.deterministic_state(seed=use_deterministic_seed)
+        deterministic_seed = self.deterministic_state(
+            seed=use_deterministic_seed)
 
-        text_tokens = torch.IntTensor(self.tokenizer.encode(text)).unsqueeze(0).to(self.device)
+        text_tokens = torch.IntTensor(
+            self.tokenizer.encode(text)).unsqueeze(0).to(self.device)
         text_tokens = F.pad(text_tokens, (0, 1))  # This may not be necessary.
         assert text_tokens.shape[-1] < 400, 'Too much text provided. Break the text up into separate segments and re-try inference.'
         auto_conds = None
         if voice_samples is not None:
-            auto_conditioning, diffusion_conditioning, auto_conds, _ = self.get_conditioning_latents(voice_samples, return_mels=True)
+            auto_conditioning, diffusion_conditioning, auto_conds, _ = self.get_conditioning_latents(
+                voice_samples, return_mels=True)
         elif conditioning_latents is not None:
             auto_conditioning, diffusion_conditioning = conditioning_latents
         else:
@@ -419,7 +448,8 @@ class TextToSpeech:
         auto_conditioning = auto_conditioning.to(self.device)
         diffusion_conditioning = diffusion_conditioning.to(self.device)
 
-        diffuser = load_discrete_vocoder_diffuser(desired_diffusion_steps=diffusion_iterations, cond_free=cond_free, cond_free_k=cond_free_k)
+        diffuser = load_discrete_vocoder_diffuser(
+            desired_diffusion_steps=diffusion_iterations, cond_free=cond_free, cond_free_k=cond_free_k)
 
         with torch.no_grad():
             samples = []
@@ -430,38 +460,40 @@ class TextToSpeech:
                 print("Generating autoregressive samples..")
             if not torch.backends.mps.is_available():
                 with self.temporary_cuda(self.autoregressive
-                ) as autoregressive, torch.autocast(device_type="cuda", dtype=torch.float16, enabled=self.half):
+                                         ) as autoregressive, torch.autocast(device_type="cuda", dtype=torch.float16, enabled=self.half):
                     for b in tqdm(range(num_batches), disable=not verbose):
                         codes = autoregressive.inference_speech(auto_conditioning, text_tokens,
-                                                                    do_sample=True,
-                                                                    top_p=top_p,
-                                                                    temperature=temperature,
-                                                                    num_return_sequences=self.autoregressive_batch_size,
-                                                                    length_penalty=length_penalty,
-                                                                    repetition_penalty=repetition_penalty,
-                                                                    max_generate_length=max_mel_tokens,
-                                                                    **hf_generate_kwargs)
+                                                                do_sample=True,
+                                                                top_p=top_p,
+                                                                temperature=temperature,
+                                                                num_return_sequences=self.autoregressive_batch_size,
+                                                                length_penalty=length_penalty,
+                                                                repetition_penalty=repetition_penalty,
+                                                                max_generate_length=max_mel_tokens,
+                                                                **hf_generate_kwargs)
                         padding_needed = max_mel_tokens - codes.shape[1]
-                        codes = F.pad(codes, (0, padding_needed), value=stop_mel_token)
+                        codes = F.pad(codes, (0, padding_needed),
+                                      value=stop_mel_token)
                         samples.append(codes)
             else:
                 with self.temporary_cuda(self.autoregressive) as autoregressive:
                     for b in tqdm(range(num_batches), disable=not verbose):
                         codes = autoregressive.inference_speech(auto_conditioning, text_tokens,
-                                                                    do_sample=True,
-                                                                    top_p=top_p,
-                                                                    temperature=temperature,
-                                                                    num_return_sequences=self.autoregressive_batch_size,
-                                                                    length_penalty=length_penalty,
-                                                                    repetition_penalty=repetition_penalty,
-                                                                    max_generate_length=max_mel_tokens,
-                                                                    **hf_generate_kwargs)
+                                                                do_sample=True,
+                                                                top_p=top_p,
+                                                                temperature=temperature,
+                                                                num_return_sequences=self.autoregressive_batch_size,
+                                                                length_penalty=length_penalty,
+                                                                repetition_penalty=repetition_penalty,
+                                                                max_generate_length=max_mel_tokens,
+                                                                **hf_generate_kwargs)
                         padding_needed = max_mel_tokens - codes.shape[1]
-                        codes = F.pad(codes, (0, padding_needed), value=stop_mel_token)
+                        codes = F.pad(codes, (0, padding_needed),
+                                      value=stop_mel_token)
                         samples.append(codes)
 
             clip_results = []
-            
+
             if not torch.backends.mps.is_available():
                 with self.temporary_cuda(self.clvp) as clvp, torch.autocast(
                     device_type="cuda" if not torch.backends.mps.is_available() else 'mps', dtype=torch.float16, enabled=self.half
@@ -474,26 +506,33 @@ class TextToSpeech:
                         if self.cvvp is None:
                             print("Computing best candidates using CLVP")
                         else:
-                            print(f"Computing best candidates using CLVP {((1-cvvp_amount) * 100):2.0f}% and CVVP {(cvvp_amount * 100):2.0f}%")
+                            print(
+                                f"Computing best candidates using CLVP {((1-cvvp_amount) * 100):2.0f}% and CVVP {(cvvp_amount * 100):2.0f}%")
                     for batch in tqdm(samples, disable=not verbose):
                         for i in range(batch.shape[0]):
-                            batch[i] = fix_autoregressive_output(batch[i], stop_mel_token)
+                            batch[i] = fix_autoregressive_output(
+                                batch[i], stop_mel_token)
                         if cvvp_amount != 1:
-                            clvp_out = clvp(text_tokens.repeat(batch.shape[0], 1), batch, return_loss=False)
+                            clvp_out = clvp(text_tokens.repeat(
+                                batch.shape[0], 1), batch, return_loss=False)
                         if auto_conds is not None and cvvp_amount > 0:
                             cvvp_accumulator = 0
                             for cl in range(auto_conds.shape[1]):
-                                cvvp_accumulator = cvvp_accumulator + self.cvvp(auto_conds[:, cl].repeat(batch.shape[0], 1, 1), batch, return_loss=False)
+                                cvvp_accumulator = cvvp_accumulator + \
+                                    self.cvvp(auto_conds[:, cl].repeat(
+                                        batch.shape[0], 1, 1), batch, return_loss=False)
                             cvvp = cvvp_accumulator / auto_conds.shape[1]
                             if cvvp_amount == 1:
                                 clip_results.append(cvvp)
                             else:
-                                clip_results.append(cvvp * cvvp_amount + clvp_out * (1-cvvp_amount))
+                                clip_results.append(
+                                    cvvp * cvvp_amount + clvp_out * (1-cvvp_amount))
                         else:
                             clip_results.append(clvp_out)
                     clip_results = torch.cat(clip_results, dim=0)
                     samples = torch.cat(samples, dim=0)
-                    best_results = samples[torch.topk(clip_results, k=k).indices]
+                    best_results = samples[torch.topk(
+                        clip_results, k=k).indices]
             else:
                 with self.temporary_cuda(self.clvp) as clvp:
                     if cvvp_amount > 0:
@@ -504,26 +543,33 @@ class TextToSpeech:
                         if self.cvvp is None:
                             print("Computing best candidates using CLVP")
                         else:
-                            print(f"Computing best candidates using CLVP {((1-cvvp_amount) * 100):2.0f}% and CVVP {(cvvp_amount * 100):2.0f}%")
+                            print(
+                                f"Computing best candidates using CLVP {((1-cvvp_amount) * 100):2.0f}% and CVVP {(cvvp_amount * 100):2.0f}%")
                     for batch in tqdm(samples, disable=not verbose):
                         for i in range(batch.shape[0]):
-                            batch[i] = fix_autoregressive_output(batch[i], stop_mel_token)
+                            batch[i] = fix_autoregressive_output(
+                                batch[i], stop_mel_token)
                         if cvvp_amount != 1:
-                            clvp_out = clvp(text_tokens.repeat(batch.shape[0], 1), batch, return_loss=False)
+                            clvp_out = clvp(text_tokens.repeat(
+                                batch.shape[0], 1), batch, return_loss=False)
                         if auto_conds is not None and cvvp_amount > 0:
                             cvvp_accumulator = 0
                             for cl in range(auto_conds.shape[1]):
-                                cvvp_accumulator = cvvp_accumulator + self.cvvp(auto_conds[:, cl].repeat(batch.shape[0], 1, 1), batch, return_loss=False)
+                                cvvp_accumulator = cvvp_accumulator + \
+                                    self.cvvp(auto_conds[:, cl].repeat(
+                                        batch.shape[0], 1, 1), batch, return_loss=False)
                             cvvp = cvvp_accumulator / auto_conds.shape[1]
                             if cvvp_amount == 1:
                                 clip_results.append(cvvp)
                             else:
-                                clip_results.append(cvvp * cvvp_amount + clvp_out * (1-cvvp_amount))
+                                clip_results.append(
+                                    cvvp * cvvp_amount + clvp_out * (1-cvvp_amount))
                         else:
                             clip_results.append(clvp_out)
                     clip_results = torch.cat(clip_results, dim=0)
                     samples = torch.cat(samples, dim=0)
-                    best_results = samples[torch.topk(clip_results, k=k).indices]
+                    best_results = samples[torch.topk(
+                        clip_results, k=k).indices]
             if self.cvvp is not None:
                 self.cvvp = self.cvvp.cpu()
             del samples
@@ -538,18 +584,22 @@ class TextToSpeech:
                     device_type="cuda" if not torch.backends.mps.is_available() else 'mps', dtype=torch.float16, enabled=self.half
                 ):
                     best_latents = autoregressive(auto_conditioning.repeat(k, 1), text_tokens.repeat(k, 1),
-                                                    torch.tensor([text_tokens.shape[-1]], device=text_tokens.device), best_results,
-                                                    torch.tensor([best_results.shape[-1]*self.autoregressive.mel_length_compression], device=text_tokens.device),
-                                                    return_latent=True, clip_inputs=False)
+                                                  torch.tensor(
+                                                      [text_tokens.shape[-1]], device=text_tokens.device), best_results,
+                                                  torch.tensor(
+                                                      [best_results.shape[-1]*self.autoregressive.mel_length_compression], device=text_tokens.device),
+                                                  return_latent=True, clip_inputs=False)
                     del auto_conditioning
             else:
                 with self.temporary_cuda(
                     self.autoregressive
                 ) as autoregressive:
                     best_latents = autoregressive(auto_conditioning.repeat(k, 1), text_tokens.repeat(k, 1),
-                                                    torch.tensor([text_tokens.shape[-1]], device=text_tokens.device), best_results,
-                                                    torch.tensor([best_results.shape[-1]*self.autoregressive.mel_length_compression], device=text_tokens.device),
-                                                    return_latent=True, clip_inputs=False)
+                                                  torch.tensor(
+                                                      [text_tokens.shape[-1]], device=text_tokens.device), best_results,
+                                                  torch.tensor(
+                                                      [best_results.shape[-1]*self.autoregressive.mel_length_compression], device=text_tokens.device),
+                                                  return_latent=True, clip_inputs=False)
                     del auto_conditioning
 
             if verbose:
@@ -570,11 +620,12 @@ class TextToSpeech:
                                 ctokens += 1
                             else:
                                 ctokens = 0
-                            if ctokens > 8:  # 8 tokens gives the diffusion model some "breathing room" to terminate speech.
+                            # 8 tokens gives the diffusion model some "breathing room" to terminate speech.
+                            if ctokens > 8:
                                 latents = latents[:, :k]
                                 break
-                        mel = do_spectrogram_diffusion(diffusion, diffuser, latents, diffusion_conditioning, temperature=diffusion_temperature, 
-                                                    verbose=verbose)
+                        mel = do_spectrogram_diffusion(diffusion, diffuser, latents, diffusion_conditioning, temperature=diffusion_temperature,
+                                                       verbose=verbose)
                         wav = vocoder.inference(mel)
                         wav_candidates.append(wav.cpu())
             else:
@@ -591,11 +642,12 @@ class TextToSpeech:
                             ctokens += 1
                         else:
                             ctokens = 0
-                        if ctokens > 8:  # 8 tokens gives the diffusion model some "breathing room" to terminate speech.
+                        # 8 tokens gives the diffusion model some "breathing room" to terminate speech.
+                        if ctokens > 8:
                             latents = latents[:, :k]
                             break
-                    mel = do_spectrogram_diffusion(diffusion, diffuser, latents, diffusion_conditioning, temperature=diffusion_temperature, 
-                                                verbose=verbose)
+                    mel = do_spectrogram_diffusion(diffusion, diffuser, latents, diffusion_conditioning, temperature=diffusion_temperature,
+                                                   verbose=verbose)
                     wav = vocoder.inference(mel)
                     wav_candidates.append(wav.cpu())
 
@@ -603,7 +655,8 @@ class TextToSpeech:
                 if self.enable_redaction:
                     return self.aligner.redact(clip.squeeze(1), text).unsqueeze(1)
                 return clip
-            wav_candidates = [potentially_redact(wav_candidate, text) for wav_candidate in wav_candidates]
+            wav_candidates = [potentially_redact(
+                wav_candidate, text) for wav_candidate in wav_candidates]
 
             if len(wav_candidates) > 1:
                 res = wav_candidates
@@ -614,6 +667,40 @@ class TextToSpeech:
                 return res, (deterministic_seed, text, voice_samples, conditioning_latents)
             else:
                 return res
+
+    def tts_long_text(self, text, preset='fast', **kwargs):
+
+        presets = {
+            'ultra_fast': {'num_autoregressive_samples': 16, 'diffusion_iterations': 30, 'cond_free': False},
+            'fast': {'num_autoregressive_samples': 96, 'diffusion_iterations': 80},
+            'standard': {'num_autoregressive_samples': 256, 'diffusion_iterations': 200},
+            'high_quality': {'num_autoregressive_samples': 256, 'diffusion_iterations': 400},
+        }
+        settings.update(presets[preset])
+        settings = {'temperature': .8, 'length_penalty': 1.0, 'repetition_penalty': 2.0,
+                    'top_p': .8,
+                    'cond_free_k': 2.0, 'diffusion_temperature': 1.0}
+        settings.update(kwargs)
+        if '|' in text:
+            print("Found the '|' character in your text, which I will use as a cue for where to split it up. If this was not"
+                  "your intent, please remove all '|' characters from the input.")
+            texts = text.split('|')
+        else:
+            texts = split_and_recombine_text(text)
+
+        all_parts = []
+        for j, text in enumerate(texts):
+            gen = self.tts_with_preset(text, voice_samples=kwargs['voice_samples'], conditioning_latents=kwargs['conditioning_latents'],
+                                       preset='fast', k=1)
+            audio_ = gen.squeeze(0).cpu()
+            # torchaudio.save(f'{path_file_tmp}_{j}.{extend_file}', audio_,
+            #                 sample_rate, format=extend_file)
+            all_parts.append(audio_)
+        full_audio = torch.cat(all_parts, dim=-1)
+        # torchaudio.save(path_file, full_audio,
+        #                 sample_rate, format=extend_file)
+        return full_audio
+
     def deterministic_state(self, seed=None):
         """
         Sets the random seeds that tortoise uses to the current time() and returns that seed so results can be
