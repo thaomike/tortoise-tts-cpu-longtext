@@ -10,7 +10,7 @@ import torch
 import torch.nn.functional as F
 import torchaudio
 from tqdm import tqdm
-from utils.text import split_and_recombine_text
+from .utils.text import split_and_recombine_text
 
 from tortoise.models.arch_util import TorchMelSpectrogram
 from tortoise.models.autoregressive import UnifiedVoice
