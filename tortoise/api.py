@@ -189,7 +189,7 @@ def pick_best_batch_size_for_gpu():
     Tries to pick a batch size that will fit in your GPU. These sizes aren't guaranteed to work, but they should give
     you a good shot.
     """
-    return 10
+    return 16
     if torch.cuda.is_available():
         _, available = torch.cuda.mem_get_info()
         availableGb = available / (1024 ** 3)
